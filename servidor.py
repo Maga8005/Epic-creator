@@ -38,8 +38,19 @@ app.secret_key = os.getenv('SECRET_KEY', secrets.token_urlsafe(32))
 authorization_codes = {}
 access_tokens = {}
 
-@app.route('/')
+@app.route('/', methods=['GET', 'POST'])
 def inicio():
+    if request.method == 'POST':
+        # Log para debug - Claude está intentando llamar a la raíz
+        print(f"⚠️ POST recibido en raíz /")
+        print(f"   Headers: {dict(request.headers)}")
+        print(f"   Data: {request.get_json()}")
+        return jsonify({
+            'error': 'Endpoint incorrecto',
+            'message': 'Usa /crear-epica-desde-claude para crear épicas',
+            'correct_endpoint': '/crear-epica-desde-claude'
+        }), 400
+    
     return """
     <h1>🚀 Servidor Epic Creator funcionando!</h1>
     <h3>📊 Endpoints disponibles:</h3>
@@ -62,7 +73,7 @@ def inicio():
 @app.route('/.well-known/oauth-authorization-server')
 def oauth_authorization_server():
     """OAuth 2.0 Authorization Server Metadata (RFC 8414)"""
-    base_url = request.host_url.rstrip('/')
+    base_url = request.host_url.rstrip('/').replace('http://', 'https://')
     
     return jsonify({
         "issuer": base_url,
@@ -77,7 +88,7 @@ def oauth_authorization_server():
 @app.route('/.well-known/ai-plugin.json')
 def ai_plugin_manifest():
     """Manifest que Claude lee para entender cómo conectarse"""
-    base_url = request.host_url.rstrip('/')
+    base_url = request.host_url.rstrip('/').replace('http://', 'https://')
     
     return jsonify({
         "schema_version": "v1",
@@ -104,7 +115,7 @@ def ai_plugin_manifest():
 @app.route('/openapi.json')
 def openapi_spec():
     """OpenAPI spec que describe los endpoints disponibles"""
-    base_url = request.host_url.rstrip('/')
+    base_url = request.host_url.rstrip('/').replace('http://', 'https://')
     
     return jsonify({
         "openapi": "3.0.0",
