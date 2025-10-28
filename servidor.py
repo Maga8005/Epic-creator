@@ -1,12 +1,14 @@
-print("🏃 Iniciando Epic Creator...")
+print("🏃 Iniciando Epic Creator con OAuth...")
 
 # Importaciones
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect, session, render_template_string
 import os
 from dotenv import load_dotenv
 import requests
 import base64
 import time
+import secrets
+import hashlib
 
 print("✅ Librerías importadas")
 
@@ -19,12 +21,22 @@ JIRA_URL = os.getenv('JIRA_URL')
 JIRA_EMAIL = os.getenv('JIRA_EMAIL') 
 JIRA_API_TOKEN = os.getenv('JIRA_API_TOKEN')
 
+# Configuración OAuth para Claude
+OAUTH_CLIENT_ID = os.getenv('OAUTH_CLIENT_ID', 'epic-creator-claude')
+OAUTH_CLIENT_SECRET = os.getenv('OAUTH_CLIENT_SECRET', secrets.token_urlsafe(32))
+
 print(f"📧 Email: {JIRA_EMAIL}")
 print(f"🌐 URL: {JIRA_URL}")
 print(f"🔑 Token: ***{JIRA_API_TOKEN[-4:] if JIRA_API_TOKEN else 'NO CONFIGURADO'}")
+print(f"🔐 OAuth Client ID: {OAUTH_CLIENT_ID}")
 
 # Crear app Flask
 app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY', secrets.token_urlsafe(32))
+
+# Almacenamiento temporal de códigos y tokens (en producción usar Redis/DB)
+authorization_codes = {}
+access_tokens = {}
 
 @app.route('/')
 def inicio():
@@ -34,10 +46,235 @@ def inicio():
     <ul>
         <li><a href="/test-jira">/test-jira</a> - Probar conexión</li>
         <li><a href="/test-crear-epica">/test-crear-epica</a> - Crear épica de prueba</li>
-        <li><a href="/test-epica-completa">/test-epica-completa</a> → Demo completa</li>
+        <li><a href="/crear-epica-desde-claude">/crear-epica-desde-claude</a> - Endpoint para Claude</li>
+    </ul>
+    <h3>🔐 OAuth Endpoints:</h3>
+    <ul>
+        <li>/oauth/authorize - Autorización OAuth</li>
+        <li>/oauth/token - Intercambio de tokens</li>
+        <li>/.well-known/ai-plugin.json - Manifest para Claude</li>
     </ul>
     <p><strong>✅ Estado:</strong> Activo</p>
     """
+
+# ============= OAUTH ENDPOINTS =============
+
+@app.route('/.well-known/ai-plugin.json')
+def ai_plugin_manifest():
+    """Manifest que Claude lee para entender cómo conectarse"""
+    base_url = request.host_url.rstrip('/')
+    
+    return jsonify({
+        "schema_version": "v1",
+        "name_for_human": "Epic Creator",
+        "name_for_model": "epic_creator",
+        "description_for_human": "Crea épicas y historias en Jira directamente desde Claude",
+        "description_for_model": "Permite crear épicas y user stories en Jira. Usa el endpoint /crear-epica-desde-claude con formato JSON.",
+        "auth": {
+            "type": "oauth",
+            "client_url": f"{base_url}/oauth/authorize",
+            "authorization_url": f"{base_url}/oauth/token",
+            "authorization_content_type": "application/json",
+            "scope": "create_epic create_story"
+        },
+        "api": {
+            "type": "openapi",
+            "url": f"{base_url}/openapi.json"
+        },
+        "logo_url": f"{base_url}/logo.png",
+        "contact_email": JIRA_EMAIL,
+        "legal_info_url": f"{base_url}"
+    })
+
+@app.route('/openapi.json')
+def openapi_spec():
+    """OpenAPI spec que describe los endpoints disponibles"""
+    base_url = request.host_url.rstrip('/')
+    
+    return jsonify({
+        "openapi": "3.0.0",
+        "info": {
+            "title": "Epic Creator API",
+            "version": "1.0.0",
+            "description": "API para crear épicas y historias en Jira"
+        },
+        "servers": [{"url": base_url}],
+        "paths": {
+            "/crear-epica-desde-claude": {
+                "post": {
+                    "summary": "Crear épica con historias",
+                    "operationId": "crearEpica",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["epic_title"],
+                                    "properties": {
+                                        "epic_title": {
+                                            "type": "string",
+                                            "description": "Título de la épica"
+                                        },
+                                        "epic_description": {
+                                            "type": "string",
+                                            "description": "Descripción de la épica"
+                                        },
+                                        "stories": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                            "description": "Lista de historias de usuario"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Épica creada exitosamente",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "epic": {"type": "object"},
+                                            "stories": {"type": "array"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+
+@app.route('/oauth/authorize')
+def oauth_authorize():
+    """Página de autorización OAuth - Claude redirige aquí"""
+    
+    # Obtener parámetros de la petición
+    client_id = request.args.get('client_id')
+    redirect_uri = request.args.get('redirect_uri')
+    state = request.args.get('state')
+    scope = request.args.get('scope', '')
+    
+    print(f"🔐 Solicitud OAuth recibida:")
+    print(f"   Client ID: {client_id}")
+    print(f"   Redirect URI: {redirect_uri}")
+    print(f"   State: {state}")
+    
+    # Validar client_id
+    if client_id != OAUTH_CLIENT_ID:
+        return "❌ Client ID inválido", 400
+    
+    # Validar redirect_uri (Claude usa dominios específicos)
+    if not redirect_uri or not redirect_uri.startswith('https://claude.ai'):
+        return "❌ Redirect URI inválido", 400
+    
+    # Generar código de autorización
+    auth_code = secrets.token_urlsafe(32)
+    
+    # Guardar código temporalmente (expira en 10 minutos)
+    authorization_codes[auth_code] = {
+        'client_id': client_id,
+        'redirect_uri': redirect_uri,
+        'timestamp': time.time(),
+        'scope': scope
+    }
+    
+    print(f"✅ Código de autorización generado: {auth_code[:10]}...")
+    
+    # Redirigir de vuelta a Claude con el código
+    callback_url = f"{redirect_uri}?code={auth_code}&state={state}"
+    return redirect(callback_url)
+
+@app.route('/oauth/token', methods=['POST'])
+def oauth_token():
+    """Intercambiar código de autorización por access token"""
+    
+    data = request.get_json() or request.form.to_dict()
+    
+    grant_type = data.get('grant_type')
+    code = data.get('code')
+    client_id = data.get('client_id')
+    client_secret = data.get('client_secret')
+    redirect_uri = data.get('redirect_uri')
+    
+    print(f"🔑 Solicitud de token:")
+    print(f"   Grant type: {grant_type}")
+    print(f"   Code: {code[:10] if code else None}...")
+    print(f"   Client ID: {client_id}")
+    
+    # Validar grant_type
+    if grant_type != 'authorization_code':
+        return jsonify({'error': 'unsupported_grant_type'}), 400
+    
+    # Validar código de autorización
+    if code not in authorization_codes:
+        return jsonify({'error': 'invalid_grant', 'error_description': 'Código inválido o expirado'}), 400
+    
+    auth_data = authorization_codes[code]
+    
+    # Verificar que no haya expirado (10 minutos)
+    if time.time() - auth_data['timestamp'] > 600:
+        del authorization_codes[code]
+        return jsonify({'error': 'invalid_grant', 'error_description': 'Código expirado'}), 400
+    
+    # Validar client_id
+    if client_id != auth_data['client_id']:
+        return jsonify({'error': 'invalid_client'}), 400
+    
+    # Generar access token
+    access_token = secrets.token_urlsafe(32)
+    refresh_token = secrets.token_urlsafe(32)
+    
+    # Guardar token (en producción: guardar en DB con expiración)
+    access_tokens[access_token] = {
+        'client_id': client_id,
+        'scope': auth_data['scope'],
+        'timestamp': time.time()
+    }
+    
+    # Eliminar código usado
+    del authorization_codes[code]
+    
+    print(f"✅ Access token generado: {access_token[:10]}...")
+    
+    # Responder con tokens
+    return jsonify({
+        'access_token': access_token,
+        'token_type': 'Bearer',
+        'expires_in': 3600,
+        'refresh_token': refresh_token,
+        'scope': auth_data['scope']
+    })
+
+def verify_token():
+    """Middleware para verificar el access token"""
+    auth_header = request.headers.get('Authorization', '')
+    
+    if not auth_header.startswith('Bearer '):
+        return None
+    
+    token = auth_header.replace('Bearer ', '')
+    
+    if token not in access_tokens:
+        return None
+    
+    token_data = access_tokens[token]
+    
+    # Verificar que no haya expirado (1 hora)
+    if time.time() - token_data['timestamp'] > 3600:
+        del access_tokens[token]
+        return None
+    
+    return token_data
+
+# ============= ENDPOINTS ORIGINALES =============
 
 @app.route('/test-jira')
 def test_jira():
@@ -108,7 +345,6 @@ def crear_epica_real():
         epic_data = datos.get('epic')
         print(f"🚀 Creando: {epic_data.get('summary')}")
         
-        # Credenciales
         credentials = f"{JIRA_EMAIL}:{JIRA_API_TOKEN}"
         encoded = base64.b64encode(credentials.encode()).decode()
         headers = {
@@ -116,7 +352,6 @@ def crear_epica_real():
             "Content-Type": "application/json"
         }
         
-        # Payload simple
         payload = {
             "fields": {
                 "project": {"key": "BIZ"},
@@ -153,188 +388,16 @@ def crear_epica_real():
             'mensaje': f'Error: {str(e)}'
         })
 
-def crear_historias_asociadas(epic_key, stories_data):
-    """Crear historias asociadas a una épica con rate limiting"""
-    
-    credentials = f"{JIRA_EMAIL}:{JIRA_API_TOKEN}"
-    encoded = base64.b64encode(credentials.encode()).decode()
-    headers = {
-        "Authorization": f"Basic {encoded}",
-        'Content-Type': 'application/json'
-    }
-
-    created_stories = []
-    
-    for i, story in enumerate(stories_data, 1):
-        story_payload = {
-    "fields": {
-        "project": {"key": "BIZ"},
-        "summary": story.get('summary'),
-        "description": {
-            "type": "doc",
-            "version": 1,
-            "content": [
-                {
-                    "type": "paragraph",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": story.get('description', '')
-                        }
-                    ]
-                }
-            ]
-        } if story.get('description') else None,
-        "issuetype": {"name": "Story"},
-        "parent": {"key": epic_key}
-    }
-}
-        
-        # Rate limiting - esperar entre historias
-        if i > 1:
-            time.sleep(2)  # 2 segundos entre historias
-            
-        try:
-            response = requests.post(f"{JIRA_URL}/rest/api/3/issue", 
-                                   json=story_payload, 
-                                   headers=headers)
-            
-            if response.status_code == 201:
-                story_data = response.json()
-                created_stories.append({
-                    'key': story_data['key'],
-                    'summary': story.get('summary'),
-                    'url': f"{JIRA_URL}/browse/{story_data['key']}"
-                })
-                print(f"✅ Historia creada: {story_data['key']}")
-            else:
-                print(f"❌ Error creando historia: {response.status_code} - {response.text}")
-                
-        except Exception as e:
-            print(f"❌ Error en historia: {str(e)}")
-    
-    return created_stories
-
-# Nuevo endpoint para prueba completa
-# @app.route('/test-epica-completa')
-def test_epica_completa():
-    """Crear una épica de prueba con historias asociadas"""
-
-    credentials = f"{JIRA_EMAIL}:{JIRA_API_TOKEN}"
-    encoded = base64.b64encode(credentials.encode()).decode()
-    headers = {
-        "Authorization": f"Basic {encoded}",
-        'Content-Type': 'application/json'
-    }
-
-    # Datos de prueba - épica completa
-    epic_data = {
-        "summary": "Sistema de Notificaciones Push - DEMO",
-        "description": "Implementar sistema completo de notificaciones push para la aplicación móvil",
-        "stories": [
-            {
-                "summary": "Investigar proveedores de push notifications (FCM, APNs)",
-                "description": "Analizar opciones técnicas y costos de implementación"
-            },
-            {
-                "summary": "Diseñar arquitectura del sistema de notificaciones",
-                "description": "Definir flujo de datos y componentes necesarios"
-            },
-            {
-                "summary": "Implementar backend para envío de notificaciones",
-                "description": "API REST para gestión y envío de push notifications"
-            },
-            {
-                "summary": "Integrar SDK en app móvil",
-                "description": "Configurar Firebase/APNs en la aplicación cliente"
-            },
-            {
-                "summary": "Crear panel de administración",
-                "description": "Interface para que marketing pueda enviar notificaciones"
-            },
-            {
-                "summary": "Testing y QA del sistema completo",
-                "description": "Pruebas de extremo a extremo del flujo de notificaciones"
-            }
-        ]
-    }
-    
-    try:
-        # 1. Crear la épica
-        print("🚀 Creando épica de demo...")
-        epic_payload = {
-    "fields": {
-        "project": {"key": "BIZ"},
-        "summary": epic_data["summary"],
-        "description": {
-            "type": "doc",
-            "version": 1,
-            "content": [
-                {
-                    "type": "paragraph",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": epic_data["description"]
-                        }
-                    ]
-                }
-            ]
-        },
-        "issuetype": {"name": "Epic"}
-    }
-}
-        
-        response = requests.post(f"{JIRA_URL}/rest/api/3/issue", 
-                               json=epic_payload, 
-                               headers=headers)
-        
-        if response.status_code != 201:
-            return f"❌ Error creando épica: {response.status_code} - {response.text}"
-        
-        epic_response = response.json()
-        epic_key = epic_response['key']
-        print(f"✅ Épica creada: {epic_key}")
-        
-        # 2. Crear historias asociadas
-        print("📚 Creando historias asociadas...")
-        created_stories = crear_historias_asociadas(epic_key, epic_data["stories"])
-        
-        # 3. Resultado
-        result = f"""
-        <h1>🎉 DEMO COMPLETA EXITOSA</h1>
-        <h2>📋 Épica Creada:</h2>
-        <p><strong>{epic_key}</strong>: {epic_data["summary"]}</p>
-        <p><a href="{JIRA_URL}/browse/{epic_key}" target="_blank">Ver en Jira →</a></p>
-        
-        <h2>📝 Historias Creadas ({len(created_stories)}):</h2>
-        <ul>
-        """
-        
-        for story in created_stories:
-            result += f'<li><strong>{story["key"]}</strong>: {story["summary"]} <a href="{story["url"]}" target="_blank">→</a></li>'
-        
-        result += """
-        </ul>
-        <p><strong>🎯 Total:</strong> 1 épica + {len} historias creadas exitosamente</p>
-        """.replace("{len}", str(len(created_stories)))
-        
-        return result
-        
-    except Exception as e:
-        return f"❌ Error en demo completa: {str(e)}"
-    
-
 @app.route('/crear-epica-desde-claude', methods=['GET', 'POST'])
 def crear_epica_desde_claude():
-    """Endpoint para recibir épicas desde Claude Projects"""
+    """Endpoint para recibir épicas desde Claude - AHORA CON OAUTH"""
     
-    # Si es GET, mostrar información
     if request.method == 'GET':
         return '''
         <h1>🔗 Epic Creator - Endpoint para Claude Projects</h1>
-        <h2>📡 Estado: Activo</h2>
+        <h2>📡 Estado: Activo con OAuth</h2>
         <p><strong>Método:</strong> POST</p>
+        <p><strong>Autenticación:</strong> Bearer Token (OAuth 2.0)</p>
         <p><strong>URL:</strong> /crear-epica-desde-claude</p>
         
         <h3>📋 Formato JSON esperado:</h3>
@@ -343,30 +406,29 @@ def crear_epica_desde_claude():
   "epic_description": "Descripción opcional",
   "stories": [
     "Historia 1",
-    "Historia 2", 
-    "Historia 3"
+    "Historia 2"
   ]
 }</pre>
-        
-        <h3>🧪 Para probar:</h3>
-        <p>Envía POST con JSON al mismo URL</p>
         
         <a href="/">← Volver al inicio</a>
         '''
     
-    # Si es POST, procesar la épica
+    # Verificar token OAuth
+    token_data = verify_token()
+    if not token_data:
+        return jsonify({'error': 'Token inválido o expirado'}), 401
+    
+    print(f"✅ Token válido para client: {token_data['client_id']}")
+    
     try:
-        # 1. Validar que lleguen datos
         if not request.json:
-            return {"error": "No se recibieron datos JSON"}, 400
+            return jsonify({"error": "No se recibieron datos JSON"}), 400
         
         data = request.json
         
-        # 2. Validar campos requeridos
         if not data.get('epic_title'):
-            return {"error": "epic_title es requerido"}, 400
+            return jsonify({"error": "epic_title es requerido"}), 400
             
-        # 3. Configurar autenticación (misma que funciona)
         credentials = f"{JIRA_EMAIL}:{JIRA_API_TOKEN}"
         encoded = base64.b64encode(credentials.encode()).decode()
         headers = {
@@ -374,7 +436,6 @@ def crear_epica_desde_claude():
             'Content-Type': 'application/json'
         }
         
-        # 4. Crear la épica
         epic_payload = {
             "fields": {
                 "project": {"key": "BIZ"},
@@ -383,7 +444,6 @@ def crear_epica_desde_claude():
             }
         }
         
-        # Agregar descripción si viene
         if data.get('epic_description'):
             epic_payload["fields"]["description"] = {
                 "type": "doc",
@@ -403,28 +463,25 @@ def crear_epica_desde_claude():
         
         print(f"🚀 Creando épica desde Claude: {data['epic_title']}")
         
-        # Crear épica en Jira
         response = requests.post(f"{JIRA_URL}/rest/api/3/issue", 
                                json=epic_payload, 
                                headers=headers)
         
         if response.status_code != 201:
-            return {
+            return jsonify({
                 "error": f"Error creando épica: {response.status_code}",
                 "details": response.text
-            }, 400
+            }), 400
         
         epic_response = response.json()
         epic_key = epic_response['key']
         print(f"✅ Épica creada: {epic_key}")
         
-        # 5. Crear historias si vienen
         created_stories = []
         if data.get('stories') and len(data['stories']) > 0:
             print(f"📝 Creando {len(data['stories'])} historias...")
             created_stories = crear_historias_para_claude(epic_key, data['stories'], headers)
         
-        # 6. Respuesta para Claude
         result = {
             "status": "success",
             "message": "Épica e historias creadas exitosamente",
@@ -437,11 +494,11 @@ def crear_epica_desde_claude():
             "total_created": f"1 épica + {len(created_stories)} historias"
         }
         
-        return result
+        return jsonify(result)
         
     except Exception as e:
         print(f"❌ Error en crear_epica_desde_claude: {str(e)}")
-        return {"error": f"Error interno: {str(e)}"}, 500
+        return jsonify({"error": f"Error interno: {str(e)}"}), 500
 
 def crear_historias_para_claude(epic_key, stories_data, headers):
     """Crear historias optimizada para Claude Projects"""
@@ -453,13 +510,12 @@ def crear_historias_para_claude(epic_key, stories_data, headers):
         story_payload = {
             "fields": {
                 "project": {"key": "BIZ"},
-                "summary": story,  # Claude envía strings simples
+                "summary": story,
                 "issuetype": {"name": "Story"},
                 "parent": {"key": epic_key}
             }
         }
         
-        # Rate limiting
         if i > 1:
             time.sleep(1)
             
@@ -482,16 +538,16 @@ def crear_historias_para_claude(epic_key, stories_data, headers):
         except Exception as e:
             print(f"❌ Error en historia: {str(e)}")
     
-    return created_stories   
+    return created_stories
 
 # Iniciar servidor
 if __name__ == '__main__':
-    print("\n🚀 Servidor iniciado!")
-    print("📍 http://127.0.0.1:5000")
-    print("🧪 http://127.0.0.1:5000/test-crear-epica")
-    # print("🎭 http://127.0.0.1:5000/test-epica-completa")
-    print("🔗 http://127.0.0.1:5000/crear-epica-desde-claude")
-    #app.run(debug=True, host='127.0.0.1', port=5000)
-    import os
+    print("\n🚀 Servidor Epic Creator con OAuth iniciado!")
+    print("📍 Endpoints OAuth configurados:")
+    print("   🔐 /.well-known/ai-plugin.json")
+    print("   🔐 /oauth/authorize")
+    print("   🔐 /oauth/token")
+    print("   📡 /crear-epica-desde-claude")
+    
     port = int(os.environ.get('PORT', 5000))
     app.run(debug=False, host='0.0.0.0', port=port)
