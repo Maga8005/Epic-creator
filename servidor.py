@@ -216,7 +216,7 @@ def crear_historias_asociadas(epic_key, stories_data):
     return created_stories
 
 # Nuevo endpoint para prueba completa
-@app.route('/test-epica-completa')
+# @app.route('/test-epica-completa')
 def test_epica_completa():
     """Crear una épica de prueba con historias asociadas"""
 
@@ -489,6 +489,9 @@ if __name__ == '__main__':
     print("\n🚀 Servidor iniciado!")
     print("📍 http://127.0.0.1:5000")
     print("🧪 http://127.0.0.1:5000/test-crear-epica")
-    print("🎭 http://127.0.0.1:5000/test-epica-completa")
+    # print("🎭 http://127.0.0.1:5000/test-epica-completa")
     print("🔗 http://127.0.0.1:5000/crear-epica-desde-claude")
-    app.run(debug=True, host='127.0.0.1', port=5000)
+    #app.run(debug=True, host='127.0.0.1', port=5000)
+    import os
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=False, host='0.0.0.0', port=port)
