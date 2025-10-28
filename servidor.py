@@ -59,6 +59,21 @@ def inicio():
 
 # ============= OAUTH ENDPOINTS =============
 
+@app.route('/.well-known/oauth-authorization-server')
+def oauth_authorization_server():
+    """OAuth 2.0 Authorization Server Metadata (RFC 8414)"""
+    base_url = request.host_url.rstrip('/')
+    
+    return jsonify({
+        "issuer": base_url,
+        "authorization_endpoint": f"{base_url}/oauth/authorize",
+        "token_endpoint": f"{base_url}/oauth/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+        "code_challenge_methods_supported": ["plain", "S256"]
+    })
+
 @app.route('/.well-known/ai-plugin.json')
 def ai_plugin_manifest():
     """Manifest que Claude lee para entender cómo conectarse"""
@@ -251,6 +266,28 @@ def oauth_token():
         'expires_in': 3600,
         'refresh_token': refresh_token,
         'scope': auth_data['scope']
+    })
+
+@app.route('/register', methods=['POST'])
+def oauth_register():
+    """Dynamic Client Registration (RFC 7591) - Claude puede registrarse automáticamente"""
+    data = request.get_json() or {}
+    
+    print(f"📝 Solicitud de registro de cliente recibida")
+    
+    # Generar client_id y secret automáticamente
+    client_id = OAUTH_CLIENT_ID
+    client_secret = OAUTH_CLIENT_SECRET
+    
+    return jsonify({
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'client_id_issued_at': int(time.time()),
+        'client_secret_expires_at': 0,  # No expira
+        'redirect_uris': data.get('redirect_uris', []),
+        'grant_types': ['authorization_code'],
+        'response_types': ['code'],
+        'token_endpoint_auth_method': 'client_secret_post'
     })
 
 def verify_token():
