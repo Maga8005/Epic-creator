@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "servidor.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "servidor.py"
+    }
+  ],
+  "env": {
+    "JIRA_URL": "@jira_url",
+    "JIRA_EMAIL": "@jira_email",
+    "JIRA_API_TOKEN": "@jira_api_token",
+    "API_KEY": "@api_key"
+  }
+}
